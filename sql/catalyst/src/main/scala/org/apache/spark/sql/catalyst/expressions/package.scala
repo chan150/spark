@@ -17,8 +17,12 @@
 
 package org.apache.spark.sql.catalyst
 
+import java.util.Locale
+
 import com.google.common.collect.Maps
 
+import org.apache.spark.sql.AnalysisException
+import org.apache.spark.sql.catalyst.analysis.{Resolver, UnresolvedAttribute}
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.types.{StructField, StructType}
 
@@ -64,7 +68,22 @@ package object expressions  {
    * column of the new row. If the schema of the input row is specified, then the given expression
    * will be bound to that schema.
    */
-  abstract class Projection extends (InternalRow => InternalRow)
+  abstract class Projection extends (InternalRow => InternalRow) {
+
+    /**
+     * Initializes internal states given the current partition index.
+     * This is used by nondeterministic expressions to set initial states.
+     * The default implementation does nothing.
+     */
+    def initialize(partitionIndex: Int): Unit = {}
+  }
+
+  /**
+   * An identity projection. This returns the input row.
+   */
+  object IdentityProjection extends Projection {
+    override def apply(row: InternalRow): InternalRow = row
+  }
 
   /**
    * Converts a [[InternalRow]] to another Row given a sequence of expression that define each
@@ -81,7 +100,7 @@ package object expressions  {
     def currentValue: InternalRow
 
     /** Uses the given row to store the output of the projection. */
-    def target(row: MutableRow): MutableProjection
+    def target(row: InternalRow): MutableProjection
   }
 
 
@@ -123,6 +142,88 @@ package object expressions  {
     def indexOf(exprId: ExprId): Int = {
       Option(exprIdToOrdinal.get(exprId)).getOrElse(-1)
     }
+
+    private def unique[T](m: Map[T, Seq[Attribute]]): Map[T, Seq[Attribute]] = {
+      m.mapValues(_.distinct).map(identity)
+    }
+
+    /** Map to use for direct case insensitive attribute lookups. */
+    @transient private lazy val direct: Map[String, Seq[Attribute]] = {
+      unique(attrs.groupBy(_.name.toLowerCase(Locale.ROOT)))
+    }
+
+    /** Map to use for qualified case insensitive attribute lookups. */
+    @transient private val qualified: Map[(String, String), Seq[Attribute]] = {
+      val grouped = attrs.filter(_.qualifier.isDefined).groupBy { a =>
+        (a.qualifier.get.toLowerCase(Locale.ROOT), a.name.toLowerCase(Locale.ROOT))
+      }
+      unique(grouped)
+    }
+
+    /** Perform attribute resolution given a name and a resolver. */
+    def resolve(nameParts: Seq[String], resolver: Resolver): Option[NamedExpression] = {
+      // Collect matching attributes given a name and a lookup.
+      def collectMatches(name: String, candidates: Option[Seq[Attribute]]): Seq[Attribute] = {
+        candidates.toSeq.flatMap(_.collect {
+          case a if resolver(a.name, name) => a.withName(name)
+        })
+      }
+
+      // Find matches for the given name assuming that the 1st part is a qualifier (i.e. table name,
+      // alias, or subquery alias) and the 2nd part is the actual name. This returns a tuple of
+      // matched attributes and a list of parts that are to be resolved.
+      //
+      // For example, consider an example where "a" is the table name, "b" is the column name,
+      // and "c" is the struct field name, i.e. "a.b.c". In this case, Attribute will be "a.b",
+      // and the second element will be List("c").
+      val matches = nameParts match {
+        case qualifier +: name +: nestedFields =>
+          val key = (qualifier.toLowerCase(Locale.ROOT), name.toLowerCase(Locale.ROOT))
+          val attributes = collectMatches(name, qualified.get(key)).filter { a =>
+            resolver(qualifier, a.qualifier.get)
+          }
+          (attributes, nestedFields)
+        case all =>
+          (Nil, all)
+      }
+
+      // If none of attributes match `table.column` pattern, we try to resolve it as a column.
+      val (candidates, nestedFields) = matches match {
+        case (Seq(), _) =>
+          val name = nameParts.head
+          val attributes = collectMatches(name, direct.get(name.toLowerCase(Locale.ROOT)))
+          (attributes, nameParts.tail)
+        case _ => matches
+      }
+
+      def name = UnresolvedAttribute(nameParts).name
+      candidates match {
+        case Seq(a) if nestedFields.nonEmpty =>
+          // One match, but we also need to extract the requested nested field.
+          // The foldLeft adds ExtractValues for every remaining parts of the identifier,
+          // and aliased it with the last part of the name.
+          // For example, consider "a.b.c", where "a" is resolved to an existing attribute.
+          // Then this will add ExtractValue("c", ExtractValue("b", a)), and alias the final
+          // expression as "c".
+          val fieldExprs = nestedFields.foldLeft(a: Expression) { (e, name) =>
+            ExtractValue(e, Literal(name), resolver)
+          }
+          Some(Alias(fieldExprs, nestedFields.last)())
+
+        case Seq(a) =>
+          // One match, no nested fields, use it.
+          Some(a)
+
+        case Seq() =>
+          // No matches.
+          None
+
+        case ambiguousReferences =>
+          // More than one match.
+          val referenceNames = ambiguousReferences.map(_.qualifiedName).mkString(", ")
+          throw new AnalysisException(s"Reference '$name' is ambiguous, could be: $referenceNames.")
+      }
+    }
   }
 
   /**
@@ -130,5 +231,5 @@ package object expressions  {
    * input will result in null output). We will use this information during constructing IsNotNull
    * constraints.
    */
-  trait NullIntolerant
+  trait NullIntolerant extends Expression
 }

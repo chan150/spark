@@ -25,7 +25,8 @@ import org.apache.spark.sql.types._
  * Compute the covariance between two expressions.
  * When applied on empty data (i.e., count is zero), it returns NULL.
  */
-abstract class Covariance(x: Expression, y: Expression) extends DeclarativeAggregate {
+abstract class Covariance(x: Expression, y: Expression)
+  extends DeclarativeAggregate with ImplicitCastInputTypes {
 
   override def children: Seq[Expression] = Seq(x, y)
   override def nullable: Boolean = true
@@ -41,23 +42,7 @@ abstract class Covariance(x: Expression, y: Expression) extends DeclarativeAggre
 
   override val initialValues: Seq[Expression] = Array.fill(4)(Literal(0.0))
 
-  override lazy val updateExpressions: Seq[Expression] = {
-    val newN = n + Literal(1.0)
-    val dx = x - xAvg
-    val dy = y - yAvg
-    val dyN = dy / newN
-    val newXAvg = xAvg + dx / newN
-    val newYAvg = yAvg + dyN
-    val newCk = ck + dx * (y - newYAvg)
-
-    val isNull = IsNull(x) || IsNull(y)
-    Seq(
-      If(isNull, n, newN),
-      If(isNull, xAvg, newXAvg),
-      If(isNull, yAvg, newYAvg),
-      If(isNull, ck, newCk)
-    )
-  }
+  override lazy val updateExpressions: Seq[Expression] = updateExpressionsDef
 
   override val mergeExpressions: Seq[Expression] = {
 
@@ -74,10 +59,28 @@ abstract class Covariance(x: Expression, y: Expression) extends DeclarativeAggre
 
     Seq(newN, newXAvg, newYAvg, newCk)
   }
+
+  protected def updateExpressionsDef: Seq[Expression] = {
+    val newN = n + Literal(1.0)
+    val dx = x - xAvg
+    val dy = y - yAvg
+    val dyN = dy / newN
+    val newXAvg = xAvg + dx / newN
+    val newYAvg = yAvg + dyN
+    val newCk = ck + dx * (y - newYAvg)
+
+    val isNull = IsNull(x) || IsNull(y)
+    Seq(
+      If(isNull, n, newN),
+      If(isNull, xAvg, newXAvg),
+      If(isNull, yAvg, newYAvg),
+      If(isNull, ck, newCk)
+    )
+  }
 }
 
 @ExpressionDescription(
-  usage = "_FUNC_(x,y) - Returns the population covariance of a set of number pairs.")
+  usage = "_FUNC_(expr1, expr2) - Returns the population covariance of a set of number pairs.")
 case class CovPopulation(left: Expression, right: Expression) extends Covariance(left, right) {
   override val evaluateExpression: Expression = {
     If(n === Literal(0.0), Literal.create(null, DoubleType),
@@ -88,7 +91,7 @@ case class CovPopulation(left: Expression, right: Expression) extends Covariance
 
 
 @ExpressionDescription(
-  usage = "_FUNC_(x,y) - Returns the sample covariance of a set of number pairs.")
+  usage = "_FUNC_(expr1, expr2) - Returns the sample covariance of a set of number pairs.")
 case class CovSample(left: Expression, right: Expression) extends Covariance(left, right) {
   override val evaluateExpression: Expression = {
     If(n === Literal(0.0), Literal.create(null, DoubleType),

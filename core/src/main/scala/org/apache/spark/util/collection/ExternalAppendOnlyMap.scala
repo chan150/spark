@@ -30,7 +30,6 @@ import org.apache.spark.{SparkEnv, TaskContext}
 import org.apache.spark.annotation.DeveloperApi
 import org.apache.spark.executor.ShuffleWriteMetrics
 import org.apache.spark.internal.Logging
-import org.apache.spark.memory.TaskMemoryManager
 import org.apache.spark.serializer.{DeserializationStream, Serializer, SerializerManager}
 import org.apache.spark.storage.{BlockId, BlockManager}
 import org.apache.spark.util.CompletionIterator
@@ -105,8 +104,8 @@ class ExternalAppendOnlyMap[K, V, C](
   private val fileBufferSize =
     sparkConf.getSizeAsKb("spark.shuffle.file.buffer", "32k").toInt * 1024
 
-  // Write metrics for current spill
-  private var curWriteMetrics: ShuffleWriteMetrics = _
+  // Write metrics
+  private val writeMetrics: ShuffleWriteMetrics = new ShuffleWriteMetrics()
 
   // Peak size of the in-memory map observed so far, in bytes
   private var _peakMemoryUsedBytes: Long = 0L
@@ -184,7 +183,7 @@ class ExternalAppendOnlyMap[K, V, C](
   override protected[this] def spill(collection: SizeTracker): Unit = {
     val inMemoryIterator = currentMap.destructiveSortedIterator(keyComparator)
     val diskMapIterator = spillMemoryIteratorToDisk(inMemoryIterator)
-    spilledMaps.append(diskMapIterator)
+    spilledMaps += diskMapIterator
   }
 
   /**
@@ -192,12 +191,19 @@ class ExternalAppendOnlyMap[K, V, C](
    * It will be called by TaskMemoryManager when there is not enough memory for the task.
    */
   override protected[this] def forceSpill(): Boolean = {
-    assert(readingIterator != null)
-    val isSpilled = readingIterator.spill()
-    if (isSpilled) {
-      currentMap = null
+    if (readingIterator != null) {
+      val isSpilled = readingIterator.spill()
+      if (isSpilled) {
+        currentMap = null
+      }
+      isSpilled
+    } else if (currentMap.size > 0) {
+      spill(currentMap)
+      currentMap = new SizeTrackingAppendOnlyMap[K, C]
+      true
+    } else {
+      false
     }
-    isSpilled
   }
 
   /**
@@ -206,8 +212,7 @@ class ExternalAppendOnlyMap[K, V, C](
   private[this] def spillMemoryIteratorToDisk(inMemoryIterator: Iterator[(K, C)])
       : DiskMapIterator = {
     val (blockId, file) = diskBlockManager.createTempLocalBlock()
-    curWriteMetrics = new ShuffleWriteMetrics()
-    var writer = blockManager.getDiskWriter(blockId, file, ser, fileBufferSize, curWriteMetrics)
+    val writer = blockManager.getDiskWriter(blockId, file, ser, fileBufferSize, writeMetrics)
     var objectsWritten = 0
 
     // List of batch sizes (bytes) in the order they are written to disk
@@ -215,11 +220,9 @@ class ExternalAppendOnlyMap[K, V, C](
 
     // Flush the disk writer's contents to disk, and update relevant variables
     def flush(): Unit = {
-      val w = writer
-      writer = null
-      w.commitAndClose()
-      _diskBytesSpilled += curWriteMetrics.bytesWritten
-      batchSizes.append(curWriteMetrics.bytesWritten)
+      val segment = writer.commitAndGet()
+      batchSizes += segment.length
+      _diskBytesSpilled += segment.length
       objectsWritten = 0
     }
 
@@ -232,25 +235,20 @@ class ExternalAppendOnlyMap[K, V, C](
 
         if (objectsWritten == serializerBatchSize) {
           flush()
-          curWriteMetrics = new ShuffleWriteMetrics()
-          writer = blockManager.getDiskWriter(blockId, file, ser, fileBufferSize, curWriteMetrics)
         }
       }
       if (objectsWritten > 0) {
         flush()
-      } else if (writer != null) {
-        val w = writer
-        writer = null
-        w.revertPartialWritesAndClose()
+        writer.close()
+      } else {
+        writer.revertPartialWritesAndClose()
       }
       success = true
     } finally {
       if (!success) {
         // This code path only happens if an exception was thrown above before we set success;
         // close our stuff and let the exception be thrown further
-        if (writer != null) {
-          writer.revertPartialWritesAndClose()
-        }
+        writer.revertPartialWritesAndClose()
         if (file.exists()) {
           if (!file.delete()) {
             logWarning(s"Error deleting ${file}")
@@ -465,7 +463,7 @@ class ExternalAppendOnlyMap[K, V, C](
 
     // An intermediate stream that reads from exactly one batch
     // This guards against pre-fetching and other arbitrary behavior of higher level streams
-    private var deserializeStream = nextBatchStream()
+    private var deserializeStream: DeserializationStream = null
     private var nextItem: (K, C) = null
     private var objectsRead = 0
 
@@ -494,8 +492,8 @@ class ExternalAppendOnlyMap[K, V, C](
           ", batchOffsets = " + batchOffsets.mkString("[", ", ", "]"))
 
         val bufferedStream = new BufferedInputStream(ByteStreams.limit(fileStream, end - start))
-        val compressedStream = serializerManager.wrapForCompression(blockId, bufferedStream)
-        ser.deserializeStream(compressedStream)
+        val wrappedStream = serializerManager.wrapStream(blockId, bufferedStream)
+        ser.deserializeStream(wrappedStream)
       } else {
         // No more batches left
         cleanup()
@@ -530,7 +528,11 @@ class ExternalAppendOnlyMap[K, V, C](
     override def hasNext: Boolean = {
       if (nextItem == null) {
         if (deserializeStream == null) {
-          return false
+          // In case of deserializeStream has not been initialized
+          deserializeStream = nextBatchStream()
+          if (deserializeStream == null) {
+            return false
+          }
         }
         nextItem = readNextItem()
       }
@@ -538,19 +540,18 @@ class ExternalAppendOnlyMap[K, V, C](
     }
 
     override def next(): (K, C) = {
-      val item = if (nextItem == null) readNextItem() else nextItem
-      if (item == null) {
+      if (!hasNext) {
         throw new NoSuchElementException
       }
+      val item = nextItem
       nextItem = null
       item
     }
 
     private def cleanup() {
       batchIndex = batchOffsets.length  // Prevent reading any other batch
-      val ds = deserializeStream
-      if (ds != null) {
-        ds.close()
+      if (deserializeStream != null) {
+        deserializeStream.close()
         deserializeStream = null
       }
       if (fileStream != null) {

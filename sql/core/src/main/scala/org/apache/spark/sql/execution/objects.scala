@@ -20,14 +20,20 @@ package org.apache.spark.sql.execution
 import scala.language.existentials
 
 import org.apache.spark.api.java.function.MapFunction
+import org.apache.spark.api.r._
+import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.rdd.RDD
+import org.apache.spark.sql.Row
+import org.apache.spark.sql.api.r.SQLUtils._
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.codegen._
 import org.apache.spark.sql.catalyst.expressions.objects.Invoke
+import org.apache.spark.sql.catalyst.plans.logical.{EventTimeWatermark, FunctionUtils, LogicalGroupState}
 import org.apache.spark.sql.catalyst.plans.physical._
-import org.apache.spark.sql.types.{DataType, ObjectType}
-
+import org.apache.spark.sql.execution.streaming.GroupStateImpl
+import org.apache.spark.sql.streaming.GroupStateTimeout
+import org.apache.spark.sql.types._
 
 /**
  * Physical version of `ObjectProducer`.
@@ -64,6 +70,8 @@ case class DeserializeToObjectExec(
     outputObjAttr: Attribute,
     child: SparkPlan) extends UnaryExecNode with ObjectProducerExec with CodegenSupport {
 
+  override def outputPartitioning: Partitioning = child.outputPartitioning
+
   override def inputRDDs(): Seq[RDD[InternalRow]] = {
     child.asInstanceOf[CodegenSupport].inputRDDs()
   }
@@ -73,16 +81,14 @@ case class DeserializeToObjectExec(
   }
 
   override def doConsume(ctx: CodegenContext, input: Seq[ExprCode], row: ExprCode): String = {
-    val bound = ExpressionCanonicalizer.execute(
-      BindReferences.bindReference(deserializer, child.output))
-    ctx.currentVars = input
-    val resultVars = bound.genCode(ctx) :: Nil
-    consume(ctx, resultVars)
+    val resultObj = BindReferences.bindReference(deserializer, child.output).genCode(ctx)
+    consume(ctx, resultObj :: Nil)
   }
 
   override protected def doExecute(): RDD[InternalRow] = {
-    child.execute().mapPartitionsInternal { iter =>
+    child.execute().mapPartitionsWithIndexInternal { (index, iter) =>
       val projection = GenerateSafeProjection.generate(deserializer :: Nil, child.output)
+      projection.initialize(index)
       iter.map(projection)
     }
   }
@@ -98,6 +104,8 @@ case class SerializeFromObjectExec(
 
   override def output: Seq[Attribute] = serializer.map(_.toAttribute)
 
+  override def outputPartitioning: Partitioning = child.outputPartitioning
+
   override def inputRDDs(): Seq[RDD[InternalRow]] = {
     child.asInstanceOf[CodegenSupport].inputRDDs()
   }
@@ -107,17 +115,16 @@ case class SerializeFromObjectExec(
   }
 
   override def doConsume(ctx: CodegenContext, input: Seq[ExprCode], row: ExprCode): String = {
-    val bound = serializer.map { expr =>
-      ExpressionCanonicalizer.execute(BindReferences.bindReference(expr, child.output))
+    val resultVars = serializer.map { expr =>
+      BindReferences.bindReference[Expression](expr, child.output).genCode(ctx)
     }
-    ctx.currentVars = input
-    val resultVars = bound.map(_.genCode(ctx))
     consume(ctx, resultVars)
   }
 
   override protected def doExecute(): RDD[InternalRow] = {
-    child.execute().mapPartitionsInternal { iter =>
+    child.execute().mapPartitionsWithIndexInternal { (index, iter) =>
       val projection = UnsafeProjection.create(serializer)
+      projection.initialize(index)
       iter.map(projection)
     }
   }
@@ -134,10 +141,15 @@ object ObjectOperator {
     (i: InternalRow) => proj(i).get(0, deserializer.dataType)
   }
 
+  def deserializeRowToObject(deserializer: Expression): InternalRow => Any = {
+    val proj = GenerateSafeProjection.generate(deserializer :: Nil)
+    (i: InternalRow) => proj(i).get(0, deserializer.dataType)
+  }
+
   def serializeObjectToRow(serializer: Seq[Expression]): Any => UnsafeRow = {
     val proj = GenerateUnsafeProjection.generate(serializer)
     val objType = serializer.head.collect { case b: BoundReference => b.dataType }.head
-    val objRow = new SpecificMutableRow(objType :: Nil)
+    val objRow = new SpecificInternalRow(objType :: Nil)
     (o: Any) => {
       objRow(0) = o
       proj(objRow)
@@ -145,7 +157,7 @@ object ObjectOperator {
   }
 
   def wrapObjectToRow(objType: DataType): Any => InternalRow = {
-    val outputRow = new SpecificMutableRow(objType :: Nil)
+    val outputRow = new SpecificInternalRow(objType :: Nil)
     (o: Any) => {
       outputRow(0) = o
       outputRow
@@ -166,6 +178,8 @@ case class MapPartitionsExec(
     outputObjAttr: Attribute,
     child: SparkPlan)
   extends ObjectConsumerExec with ObjectProducerExec {
+
+  override def outputPartitioning: Partitioning = child.outputPartitioning
 
   override protected def doExecute(): RDD[InternalRow] = {
     child.execute().mapPartitionsInternal { iter =>
@@ -200,17 +214,14 @@ case class MapElementsExec(
   override def doConsume(ctx: CodegenContext, input: Seq[ExprCode], row: ExprCode): String = {
     val (funcClass, methodName) = func match {
       case m: MapFunction[_, _] => classOf[MapFunction[_, _]] -> "call"
-      case _ => classOf[Any => Any] -> "apply"
+      case _ => FunctionUtils.getFunctionOneName(outputObjAttr.dataType, child.output(0).dataType)
     }
     val funcObj = Literal.create(func, ObjectType(funcClass))
     val callFunc = Invoke(funcObj, methodName, outputObjAttr.dataType, child.output)
 
-    val bound = ExpressionCanonicalizer.execute(
-      BindReferences.bindReference(callFunc, child.output))
-    ctx.currentVars = input
-    val resultVars = bound.genCode(ctx) :: Nil
+    val result = BindReferences.bindReference(callFunc, child.output).genCode(ctx)
 
-    consume(ctx, resultVars)
+    consume(ctx, result :: Nil)
   }
 
   override protected def doExecute(): RDD[InternalRow] = {
@@ -227,6 +238,8 @@ case class MapElementsExec(
   }
 
   override def outputOrdering: Seq[SortOrder] = child.outputOrdering
+
+  override def outputPartitioning: Partitioning = child.outputPartitioning
 }
 
 /**
@@ -239,6 +252,8 @@ case class AppendColumnsExec(
     child: SparkPlan) extends UnaryExecNode {
 
   override def output: Seq[Attribute] = child.output ++ serializer.map(_.toAttribute)
+
+  override def outputPartitioning: Partitioning = child.outputPartitioning
 
   private def newColumnSchema = serializer.map(_.toAttribute).toStructType
 
@@ -267,6 +282,8 @@ case class AppendColumnsWithObjectExec(
     child: SparkPlan) extends ObjectConsumerExec {
 
   override def output: Seq[Attribute] = (inputSerializer ++ newColumnsSerializer).map(_.toAttribute)
+
+  override def outputPartitioning: Partitioning = child.outputPartitioning
 
   private def inputSchema = inputSerializer.map(_.toAttribute).toStructType
   private def newColumnSchema = newColumnsSerializer.map(_.toAttribute).toStructType
@@ -300,6 +317,8 @@ case class MapGroupsExec(
     outputObjAttr: Attribute,
     child: SparkPlan) extends UnaryExecNode with ObjectProducerExec {
 
+  override def outputPartitioning: Partitioning = child.outputPartitioning
+
   override def requiredChildDistribution: Seq[Distribution] =
     ClusteredDistribution(groupingAttributes) :: Nil
 
@@ -318,6 +337,100 @@ case class MapGroupsExec(
         val result = func(
           getKey(key),
           rowIter.map(getValue))
+        result.map(outputObject)
+      }
+    }
+  }
+}
+
+object MapGroupsExec {
+  def apply(
+      func: (Any, Iterator[Any], LogicalGroupState[Any]) => TraversableOnce[Any],
+      keyDeserializer: Expression,
+      valueDeserializer: Expression,
+      groupingAttributes: Seq[Attribute],
+      dataAttributes: Seq[Attribute],
+      outputObjAttr: Attribute,
+      timeoutConf: GroupStateTimeout,
+      child: SparkPlan): MapGroupsExec = {
+    val watermarkPresent = child.output.exists {
+      case a: Attribute if a.metadata.contains(EventTimeWatermark.delayKey) => true
+      case _ => false
+    }
+    val f = (key: Any, values: Iterator[Any]) => {
+      func(key, values, GroupStateImpl.createForBatch(timeoutConf, watermarkPresent))
+    }
+    new MapGroupsExec(f, keyDeserializer, valueDeserializer,
+      groupingAttributes, dataAttributes, outputObjAttr, child)
+  }
+}
+
+/**
+ * Groups the input rows together and calls the R function with each group and an iterator
+ * containing all elements in the group.
+ * The result of this function is flattened before being output.
+ */
+case class FlatMapGroupsInRExec(
+    func: Array[Byte],
+    packageNames: Array[Byte],
+    broadcastVars: Array[Broadcast[Object]],
+    inputSchema: StructType,
+    outputSchema: StructType,
+    keyDeserializer: Expression,
+    valueDeserializer: Expression,
+    groupingAttributes: Seq[Attribute],
+    dataAttributes: Seq[Attribute],
+    outputObjAttr: Attribute,
+    child: SparkPlan) extends UnaryExecNode with ObjectProducerExec {
+
+  override def output: Seq[Attribute] = outputObjAttr :: Nil
+
+  override def outputPartitioning: Partitioning = child.outputPartitioning
+
+  override def producedAttributes: AttributeSet = AttributeSet(outputObjAttr)
+
+  override def requiredChildDistribution: Seq[Distribution] =
+    if (groupingAttributes.isEmpty) {
+      AllTuples :: Nil
+    } else {
+      ClusteredDistribution(groupingAttributes) :: Nil
+    }
+
+  override def requiredChildOrdering: Seq[Seq[SortOrder]] =
+    Seq(groupingAttributes.map(SortOrder(_, Ascending)))
+
+  override protected def doExecute(): RDD[InternalRow] = {
+    val isSerializedRData = outputSchema == SERIALIZED_R_DATA_SCHEMA
+    val serializerForR = if (!isSerializedRData) {
+      SerializationFormats.ROW
+    } else {
+      SerializationFormats.BYTE
+    }
+
+    child.execute().mapPartitionsInternal { iter =>
+      val grouped = GroupedIterator(iter, groupingAttributes, child.output)
+      val getKey = ObjectOperator.deserializeRowToObject(keyDeserializer, groupingAttributes)
+      val getValue = ObjectOperator.deserializeRowToObject(valueDeserializer, dataAttributes)
+      val outputObject = ObjectOperator.wrapObjectToRow(outputObjAttr.dataType)
+      val runner = new RRunner[Array[Byte]](
+        func, SerializationFormats.ROW, serializerForR, packageNames, broadcastVars,
+        isDataFrame = true, colNames = inputSchema.fieldNames,
+        mode = RRunnerModes.DATAFRAME_GAPPLY)
+
+      val groupedRBytes = grouped.map { case (key, rowIter) =>
+        val deserializedIter = rowIter.map(getValue)
+        val newIter =
+          deserializedIter.asInstanceOf[Iterator[Row]].map { row => rowToRBytes(row) }
+        val newKey = rowToRBytes(getKey(key).asInstanceOf[Row])
+        (newKey, newIter)
+      }
+
+      val outputIter = runner.compute(groupedRBytes, -1)
+      if (!isSerializedRData) {
+        val result = outputIter.map { bytes => bytesToRow(bytes, outputSchema) }
+        result.map(outputObject)
+      } else {
+        val result = outputIter.map { bytes => Row.fromSeq(Seq(bytes)) }
         result.map(outputObject)
       }
     }
@@ -343,7 +456,7 @@ case class CoGroupExec(
     right: SparkPlan) extends BinaryExecNode with ObjectProducerExec {
 
   override def requiredChildDistribution: Seq[Distribution] =
-    ClusteredDistribution(leftGroup) :: ClusteredDistribution(rightGroup) :: Nil
+    HashClusteredDistribution(leftGroup) :: HashClusteredDistribution(rightGroup) :: Nil
 
   override def requiredChildOrdering: Seq[Seq[SortOrder]] =
     leftGroup.map(SortOrder(_, Ascending)) :: rightGroup.map(SortOrder(_, Ascending)) :: Nil

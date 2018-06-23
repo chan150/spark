@@ -83,7 +83,7 @@ Once you've set up this file, you can launch or stop your cluster with the follo
 - `sbin/start-slaves.sh` - Starts a slave instance on each machine specified in the `conf/slaves` file.
 - `sbin/start-slave.sh` - Starts a slave instance on the machine the script is executed on.
 - `sbin/start-all.sh` - Starts both a master and a number of slaves as described above.
-- `sbin/stop-master.sh` - Stops the master that was started via the `bin/start-master.sh` script.
+- `sbin/stop-master.sh` - Stops the master that was started via the `sbin/start-master.sh` script.
 - `sbin/stop-slaves.sh` - Stops all slave instances on the machines specified in the `conf/slaves` file.
 - `sbin/stop-all.sh` - Stops both the master and the slaves as described above.
 
@@ -150,6 +150,10 @@ You can optionally configure the cluster further by setting environment variable
     <td>JVM options for the Spark master and worker daemons themselves in the form "-Dx=y" (default: none).</td>
   </tr>
   <tr>
+    <td><code>SPARK_DAEMON_CLASSPATH</code></td>
+    <td>Classpath for the Spark master and worker daemons themselves (default: none).</td>
+  </tr>
+  <tr>
     <td><code>SPARK_PUBLIC_DNS</code></td>
     <td>The public DNS name of the Spark master and workers (default: none).</td>
   </tr>
@@ -196,6 +200,21 @@ SPARK_MASTER_OPTS supports the following system properties:
   </td>
 </tr>
 <tr>
+  <td><code>spark.deploy.maxExecutorRetries</code></td>
+  <td>10</td>
+  <td>
+    Limit on the maximum number of back-to-back executor failures that can occur before the
+    standalone cluster manager removes a faulty application. An application will never be removed
+    if it has any running executors. If an application experiences more than
+    <code>spark.deploy.maxExecutorRetries</code> failures in a row, no executors
+    successfully start running in between those failures, and the application has no running
+    executors then the standalone cluster manager will remove the application and mark it as failed.
+    To disable this automatic removal, set <code>spark.deploy.maxExecutorRetries</code> to
+    <code>-1</code>.
+    <br/>
+  </td>
+</tr>
+<tr>
   <td><code>spark.worker.timeout</code></td>
   <td>60</td>
   <td>
@@ -227,7 +246,7 @@ SPARK_WORKER_OPTS supports the following system properties:
 </tr>
 <tr>
   <td><code>spark.worker.cleanup.appDataTtl</code></td>
-  <td>7 * 24 * 3600 (7 days)</td>
+  <td>604800 (7 days, 7 * 24 * 3600)</td>
   <td>
     The number of seconds to retain application work directories on each worker.  This is a Time To Live
     and should depend on the amount of available disk space you have.  Application logs and jars are
@@ -235,12 +254,33 @@ SPARK_WORKER_OPTS supports the following system properties:
     especially if you run jobs very frequently.
   </td>
 </tr>
+<tr>
+  <td><code>spark.storage.cleanupFilesAfterExecutorExit</code></td>
+  <td>true</td>
+  <td>
+    Enable cleanup non-shuffle files(such as temp. shuffle blocks, cached RDD/broadcast blocks,
+    spill files, etc) of worker directories following executor exits. Note that this doesn't
+    overlap with `spark.worker.cleanup.enabled`, as this enables cleanup of non-shuffle files in
+    local directories of a dead executor, while `spark.worker.cleanup.enabled` enables cleanup of
+    all files/subdirectories of a stopped and timeout application.
+    This only affects Standalone mode, support of other cluster manangers can be added in the future.
+  </td>
+</tr>
+<tr>
+  <td><code>spark.worker.ui.compressedLogFileLengthCacheSize</code></td>
+  <td>100</td>
+  <td>
+    For compressed log files, the uncompressed file can only be computed by uncompressing the files.
+    Spark caches the uncompressed file size of compressed log files. This property controls the cache
+    size.
+  </td>
+</tr>
 </table>
 
 # Connecting an Application to the Cluster
 
 To run an application on the Spark cluster, simply pass the `spark://IP:PORT` URL of the master as to the [`SparkContext`
-constructor](programming-guide.html#initializing-spark).
+constructor](rdd-programming-guide.html#initializing-spark).
 
 To run an interactive Spark shell against the cluster, run the following command:
 
@@ -283,9 +323,9 @@ application at a time. You can cap the number of cores by setting `spark.cores.m
 
 {% highlight scala %}
 val conf = new SparkConf()
-             .setMaster(...)
-             .setAppName(...)
-             .set("spark.cores.max", "10")
+  .setMaster(...)
+  .setAppName(...)
+  .set("spark.cores.max", "10")
 val sc = new SparkContext(conf)
 {% endhighlight %}
 
@@ -300,9 +340,17 @@ export SPARK_MASTER_OPTS="-Dspark.deploy.defaultCores=<value>"
 This is useful on shared clusters where users might not have configured a maximum number of cores
 individually.
 
+# Executors Scheduling
+
+The number of cores assigned to each executor is configurable. When `spark.executor.cores` is
+explicitly set, multiple executors from the same application may be launched on the same worker
+if the worker has enough cores and memory. Otherwise, each executor grabs all the cores available
+on the worker by default, in which case only one executor per application may be launched on each
+worker during one single schedule iteration.
+
 # Monitoring and Logging
 
-Spark's standalone mode offers a web-based user interface to monitor the cluster. The master and each worker has its own web UI that shows cluster and job statistics. By default you can access the web UI for the master at port 8080. The port can be changed either in the configuration file or via command-line options.
+Spark's standalone mode offers a web-based user interface to monitor the cluster. The master and each worker has its own web UI that shows cluster and job statistics. By default, you can access the web UI for the master at port 8080. The port can be changed either in the configuration file or via command-line options.
 
 In addition, detailed log output for each job is also written to the work directory of each slave node (`SPARK_HOME/work` by default). You will see two files for each job, `stdout` and `stderr`, with all output it wrote to its console.
 
@@ -328,12 +376,12 @@ By default, standalone scheduling clusters are resilient to Worker failures (ins
 
 Utilizing ZooKeeper to provide leader election and some state storage, you can launch multiple Masters in your cluster connected to the same ZooKeeper instance. One will be elected "leader" and the others will remain in standby mode. If the current leader dies, another Master will be elected, recover the old Master's state, and then resume scheduling. The entire recovery process (from the time the first leader goes down) should take between 1 and 2 minutes. Note that this delay only affects scheduling _new_ applications -- applications that were already running during Master failover are unaffected.
 
-Learn more about getting started with ZooKeeper [here](http://zookeeper.apache.org/doc/trunk/zookeeperStarted.html).
+Learn more about getting started with ZooKeeper [here](http://zookeeper.apache.org/doc/current/zookeeperStarted.html).
 
 **Configuration**
 
 In order to enable this recovery mode, you can set SPARK_DAEMON_JAVA_OPTS in spark-env by configuring `spark.deploy.recoveryMode` and related spark.deploy.zookeeper.* configurations.
-For more information about these configurations please refer to the configurations (doc)[configurations.html#deploy]
+For more information about these configurations please refer to the [configuration doc](configuration.html#deploy)
 
 Possible gotcha: If you have multiple Masters in your cluster but fail to correctly configure the Masters to use ZooKeeper, the Masters will fail to discover each other and think they're all leaders. This will not lead to a healthy cluster state (as all Masters will schedule independently).
 

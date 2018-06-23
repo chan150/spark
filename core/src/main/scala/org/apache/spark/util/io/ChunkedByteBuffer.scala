@@ -24,6 +24,8 @@ import java.nio.channels.WritableByteChannel
 import com.google.common.primitives.UnsignedBytes
 import io.netty.buffer.{ByteBuf, Unpooled}
 
+import org.apache.spark.SparkEnv
+import org.apache.spark.internal.config
 import org.apache.spark.network.util.ByteArrayWritableChannel
 import org.apache.spark.storage.StorageUtils
 
@@ -31,15 +33,19 @@ import org.apache.spark.storage.StorageUtils
  * Read-only byte buffer which is physically stored as multiple chunks rather than a single
  * contiguous array.
  *
- * @param chunks an array of [[ByteBuffer]]s. Each buffer in this array must be non-empty and have
- *               position == 0. Ownership of these buffers is transferred to the ChunkedByteBuffer,
- *               so if these buffers may also be used elsewhere then the caller is responsible for
- *               copying them as needed.
+ * @param chunks an array of [[ByteBuffer]]s. Each buffer in this array must have position == 0.
+ *               Ownership of these buffers is transferred to the ChunkedByteBuffer, so if these
+ *               buffers may also be used elsewhere then the caller is responsible for copying
+ *               them as needed.
  */
 private[spark] class ChunkedByteBuffer(var chunks: Array[ByteBuffer]) {
   require(chunks != null, "chunks must not be null")
-  require(chunks.forall(_.limit() > 0), "chunks must be non-empty")
   require(chunks.forall(_.position() == 0), "chunks' positions must be 0")
+
+  // Chunk size in bytes
+  private val bufferWriteChunkSize =
+    Option(SparkEnv.get).map(_.conf.get(config.BUFFER_WRITE_CHUNK_SIZE))
+      .getOrElse(config.BUFFER_WRITE_CHUNK_SIZE.defaultValue.get).toInt
 
   private[this] var disposed: Boolean = false
 
@@ -57,8 +63,19 @@ private[spark] class ChunkedByteBuffer(var chunks: Array[ByteBuffer]) {
    */
   def writeFully(channel: WritableByteChannel): Unit = {
     for (bytes <- getChunks()) {
-      while (bytes.remaining > 0) {
+      val originalLimit = bytes.limit()
+      while (bytes.hasRemaining) {
+        // If `bytes` is an on-heap ByteBuffer, the Java NIO API will copy it to a temporary direct
+        // ByteBuffer when writing it out. This temporary direct ByteBuffer is cached per thread.
+        // Its size has no limit and can keep growing if it sees a larger input ByteBuffer. This may
+        // cause significant native memory leak, if a large direct ByteBuffer is allocated and
+        // cached, as it's never released until thread exits. Here we write the `bytes` with
+        // fixed-size slices to limit the size of the cached direct ByteBuffer.
+        // Please refer to http://www.evanjones.ca/java-bytebuffer-leak.html for more details.
+        val ioSize = Math.min(bytes.remaining(), bufferWriteChunkSize)
+        bytes.limit(bytes.position() + ioSize)
         channel.write(bytes)
+        bytes.limit(originalLimit)
       }
     }
   }
@@ -67,7 +84,7 @@ private[spark] class ChunkedByteBuffer(var chunks: Array[ByteBuffer]) {
    * Wrap this buffer to view it as a Netty ByteBuf.
    */
   def toNetty: ByteBuf = {
-    Unpooled.wrappedBuffer(getChunks(): _*)
+    Unpooled.wrappedBuffer(chunks.length, getChunks(): _*)
   }
 
   /**
@@ -87,7 +104,11 @@ private[spark] class ChunkedByteBuffer(var chunks: Array[ByteBuffer]) {
   }
 
   /**
-   * Copy this buffer into a new ByteBuffer.
+   * Convert this buffer to a ByteBuffer. If this buffer is backed by a single chunk, its underlying
+   * data will not be copied. Instead, it will be duplicated. If this buffer is backed by multiple
+   * chunks, the data underlying this buffer will be copied into a new byte buffer. As a result, it
+   * is suggested to use this method only if the caller does not need to manage the memory
+   * underlying this buffer.
    *
    * @throws UnsupportedOperationException if this buffer's size exceeds the max ByteBuffer size.
    */
@@ -133,10 +154,8 @@ private[spark] class ChunkedByteBuffer(var chunks: Array[ByteBuffer]) {
   }
 
   /**
-   * Attempt to clean up a ByteBuffer if it is memory-mapped. This uses an *unsafe* Sun API that
-   * might cause errors if one attempts to read from the unmapped buffer, but it's better than
-   * waiting for the GC to find it because that could lead to huge numbers of open files. There's
-   * unfortunately no standard API to do this.
+   * Attempt to clean up any ByteBuffer in this ChunkedByteBuffer which is direct or memory-mapped.
+   * See [[StorageUtils.dispose]] for more information.
    */
   def dispose(): Unit = {
     if (!disposed) {
@@ -144,15 +163,16 @@ private[spark] class ChunkedByteBuffer(var chunks: Array[ByteBuffer]) {
       disposed = true
     }
   }
+
 }
 
 /**
  * Reads data from a ChunkedByteBuffer.
  *
- * @param dispose if true, [[ChunkedByteBuffer.dispose()]] will be called at the end of the stream
+ * @param dispose if true, `ChunkedByteBuffer.dispose()` will be called at the end of the stream
  *                in order to close any memory-mapped files which back the buffer.
  */
-private class ChunkedByteBufferInputStream(
+private[spark] class ChunkedByteBufferInputStream(
     var chunkedByteBuffer: ChunkedByteBuffer,
     dispose: Boolean)
   extends InputStream {
@@ -195,7 +215,7 @@ private class ChunkedByteBufferInputStream(
   override def skip(bytes: Long): Long = {
     if (currentChunk != null) {
       val amountToSkip = math.min(bytes, currentChunk.remaining).toInt
-      currentChunk.position(currentChunk.position + amountToSkip)
+      currentChunk.position(currentChunk.position() + amountToSkip)
       if (currentChunk.remaining() == 0) {
         if (chunks.hasNext) {
           currentChunk = chunks.next()

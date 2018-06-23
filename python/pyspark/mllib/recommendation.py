@@ -16,6 +16,7 @@
 #
 
 import array
+import sys
 from collections import namedtuple
 
 from pyspark import SparkContext, since
@@ -207,7 +208,7 @@ class MatrixFactorizationModel(JavaModelWrapper, JavaSaveable, JavaLoader):
     def load(cls, sc, path):
         """Load a model from the given path"""
         model = cls._load_java(sc, path)
-        wrapper = sc._jvm.MatrixFactorizationModelWrapper(model)
+        wrapper = sc._jvm.org.apache.spark.mllib.api.python.MatrixFactorizationModelWrapper(model)
         return MatrixFactorizationModel(wrapper)
 
 
@@ -249,7 +250,7 @@ class ALS(object):
         :param ratings:
           RDD of `Rating` or (userID, productID, rating) tuple.
         :param rank:
-          Rank of the feature matrices computed (number of features).
+          Number of features to use (also referred to as the number of latent factors).
         :param iterations:
           Number of iterations of ALS.
           (default: 5)
@@ -287,7 +288,7 @@ class ALS(object):
         :param ratings:
           RDD of `Rating` or (userID, productID, rating) tuple.
         :param rank:
-          Rank of the feature matrices computed (number of features).
+          Number of features to use (also referred to as the number of latent factors).
         :param iterations:
           Number of iterations of ALS.
           (default: 5)
@@ -326,7 +327,7 @@ def _test():
     (failure_count, test_count) = doctest.testmod(globs=globs, optionflags=doctest.ELLIPSIS)
     globs['sc'].stop()
     if failure_count:
-        exit(-1)
+        sys.exit(-1)
 
 
 if __name__ == "__main__":

@@ -17,10 +17,11 @@
 
 package org.apache.spark
 
-import org.scalatest.concurrent.Timeouts._
 import org.scalatest.Matchers
+import org.scalatest.concurrent.{Signaler, ThreadSignaler, TimeLimits}
 import org.scalatest.time.{Millis, Span}
 
+import org.apache.spark.security.EncryptionFunSuite
 import org.apache.spark.storage.{RDDBlockId, StorageLevel}
 import org.apache.spark.util.io.ChunkedByteBuffer
 
@@ -28,7 +29,11 @@ class NotSerializableClass
 class NotSerializableExn(val notSer: NotSerializableClass) extends Throwable() {}
 
 
-class DistributedSuite extends SparkFunSuite with Matchers with LocalSparkContext {
+class DistributedSuite extends SparkFunSuite with Matchers with LocalSparkContext
+  with EncryptionFunSuite with TimeLimits {
+
+  // Necessary to make ScalaTest 3.x interrupt a thread on the JVM like ScalaTest 2.2.x
+  implicit val defaultSignaler: Signaler = ThreadSignaler
 
   val clusterUrl = "local-cluster[2,1,1024]"
 
@@ -134,62 +139,29 @@ class DistributedSuite extends SparkFunSuite with Matchers with LocalSparkContex
     }
   }
 
-  test("caching") {
+  test("repeatedly failing task that crashes JVM with a zero exit code (SPARK-16925)") {
+    // Ensures that if a task which causes the JVM to exit with a zero exit code will cause the
+    // Spark job to eventually fail.
     sc = new SparkContext(clusterUrl, "test")
-    val data = sc.parallelize(1 to 1000, 10).cache()
-    assert(data.count() === 1000)
-    assert(data.count() === 1000)
-    assert(data.count() === 1000)
+    failAfter(Span(100000, Millis)) {
+      val thrown = intercept[SparkException] {
+        sc.parallelize(1 to 1, 1).foreachPartition { _ => System.exit(0) }
+      }
+      assert(thrown.getClass === classOf[SparkException])
+      assert(thrown.getMessage.contains("failed 4 times"))
+    }
+    // Check that the cluster is still usable:
+    sc.parallelize(1 to 10).count()
   }
 
-  test("caching on disk") {
-    sc = new SparkContext(clusterUrl, "test")
-    val data = sc.parallelize(1 to 1000, 10).persist(StorageLevel.DISK_ONLY)
-    assert(data.count() === 1000)
-    assert(data.count() === 1000)
-    assert(data.count() === 1000)
-  }
-
-  test("caching in memory, replicated") {
-    sc = new SparkContext(clusterUrl, "test")
-    val data = sc.parallelize(1 to 1000, 10).persist(StorageLevel.MEMORY_ONLY_2)
-    assert(data.count() === 1000)
-    assert(data.count() === 1000)
-    assert(data.count() === 1000)
-  }
-
-  test("caching in memory, serialized, replicated") {
-    sc = new SparkContext(clusterUrl, "test")
-    val data = sc.parallelize(1 to 1000, 10).persist(StorageLevel.MEMORY_ONLY_SER_2)
-    assert(data.count() === 1000)
-    assert(data.count() === 1000)
-    assert(data.count() === 1000)
-  }
-
-  test("caching on disk, replicated") {
-    sc = new SparkContext(clusterUrl, "test")
-    val data = sc.parallelize(1 to 1000, 10).persist(StorageLevel.DISK_ONLY_2)
-    assert(data.count() === 1000)
-    assert(data.count() === 1000)
-    assert(data.count() === 1000)
-  }
-
-  test("caching in memory and disk, replicated") {
-    sc = new SparkContext(clusterUrl, "test")
-    val data = sc.parallelize(1 to 1000, 10).persist(StorageLevel.MEMORY_AND_DISK_2)
-    assert(data.count() === 1000)
-    assert(data.count() === 1000)
-    assert(data.count() === 1000)
-  }
-
-  test("caching in memory and disk, serialized, replicated") {
-    sc = new SparkContext(clusterUrl, "test")
-    val data = sc.parallelize(1 to 1000, 10).persist(StorageLevel.MEMORY_AND_DISK_SER_2)
-
-    assert(data.count() === 1000)
-    assert(data.count() === 1000)
-    assert(data.count() === 1000)
-
+  private def testCaching(conf: SparkConf, storageLevel: StorageLevel): Unit = {
+    sc = new SparkContext(conf.setMaster(clusterUrl).setAppName("test"))
+    TestUtils.waitUntilExecutorsUp(sc, 2, 30000)
+    val data = sc.parallelize(1 to 1000, 10)
+    val cachedData = data.persist(storageLevel)
+    assert(cachedData.count === 1000)
+    assert(sc.getRDDStorageInfo.filter(_.id == cachedData.id).map(_.numCachedPartitions).sum ===
+      data.getNumPartitions)
     // Get all the locations of the first partition and try to fetch the partitions
     // from those locations.
     val blockIds = data.partitions.indices.map(index => RDDBlockId(data.id, index)).toArray
@@ -199,10 +171,26 @@ class DistributedSuite extends SparkFunSuite with Matchers with LocalSparkContex
     val serializerManager = SparkEnv.get.serializerManager
     blockManager.master.getLocations(blockId).foreach { cmId =>
       val bytes = blockTransfer.fetchBlockSync(cmId.host, cmId.port, cmId.executorId,
-        blockId.toString)
-      val deserialized = serializerManager.dataDeserializeStream[Int](blockId,
-        new ChunkedByteBuffer(bytes.nioByteBuffer()).toInputStream()).toList
+        blockId.toString, null)
+      val deserialized = serializerManager.dataDeserializeStream(blockId,
+        new ChunkedByteBuffer(bytes.nioByteBuffer()).toInputStream())(data.elementClassTag).toList
       assert(deserialized === (1 to 100).toList)
+    }
+    // This will exercise the getRemoteBytes / getRemoteValues code paths:
+    assert(blockIds.flatMap(id => blockManager.get[Int](id).get.data).toSet === (1 to 1000).toSet)
+  }
+
+  Seq(
+    "caching" -> StorageLevel.MEMORY_ONLY,
+    "caching on disk" -> StorageLevel.DISK_ONLY,
+    "caching in memory, replicated" -> StorageLevel.MEMORY_ONLY_2,
+    "caching in memory, serialized, replicated" -> StorageLevel.MEMORY_ONLY_SER_2,
+    "caching on disk, replicated" -> StorageLevel.DISK_ONLY_2,
+    "caching in memory and disk, replicated" -> StorageLevel.MEMORY_AND_DISK_2,
+    "caching in memory and disk, serialized, replicated" -> StorageLevel.MEMORY_AND_DISK_SER_2
+  ).foreach { case (testName, storageLevel) =>
+    encryptionTest(testName) { conf =>
+      testCaching(conf, storageLevel)
     }
   }
 
@@ -223,7 +211,7 @@ class DistributedSuite extends SparkFunSuite with Matchers with LocalSparkContex
 
   test("compute when only some partitions fit in memory") {
     val size = 10000
-    val numPartitions = 10
+    val numPartitions = 20
     val conf = new SparkConf()
       .set("spark.storage.unrollMemoryThreshold", "1024")
       .set("spark.testing.memory", size.toString)

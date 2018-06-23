@@ -19,13 +19,16 @@ package org.apache.spark.sql.execution.joins
 
 import java.io.{ByteArrayInputStream, ByteArrayOutputStream, ObjectInputStream, ObjectOutputStream}
 
+import scala.util.Random
+
 import org.apache.spark.{SparkConf, SparkFunSuite}
+import org.apache.spark.internal.config.MEMORY_OFFHEAP_ENABLED
 import org.apache.spark.memory.{StaticMemoryManager, TaskMemoryManager}
 import org.apache.spark.serializer.KryoSerializer
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.test.SharedSQLContext
-import org.apache.spark.sql.types.{IntegerType, LongType, StringType, StructField, StructType}
+import org.apache.spark.sql.types._
 import org.apache.spark.unsafe.map.BytesToBytesMap
 import org.apache.spark.unsafe.types.UTF8String
 import org.apache.spark.util.collection.CompactBuffer
@@ -34,7 +37,7 @@ class HashedRelationSuite extends SparkFunSuite with SharedSQLContext {
 
   val mm = new TaskMemoryManager(
     new StaticMemoryManager(
-      new SparkConf().set("spark.memory.offHeap.enabled", "false"),
+      new SparkConf().set(MEMORY_OFFHEAP_ENABLED.key, "false"),
       Long.MaxValue,
       Long.MaxValue,
       1),
@@ -83,7 +86,7 @@ class HashedRelationSuite extends SparkFunSuite with SharedSQLContext {
   test("test serialization empty hash map") {
     val taskMemoryManager = new TaskMemoryManager(
       new StaticMemoryManager(
-        new SparkConf().set("spark.memory.offHeap.enabled", "false"),
+        new SparkConf().set(MEMORY_OFFHEAP_ENABLED.key, "false"),
         Long.MaxValue,
         Long.MaxValue,
         1),
@@ -150,6 +153,129 @@ class HashedRelationSuite extends SparkFunSuite with SharedSQLContext {
       assert(rows(1).getLong(0) === i)
       assert(rows(1).getInt(1) === i + 1)
     }
+  }
+
+  test("LongToUnsafeRowMap with very wide range") {
+    val taskMemoryManager = new TaskMemoryManager(
+      new StaticMemoryManager(
+        new SparkConf().set(MEMORY_OFFHEAP_ENABLED.key, "false"),
+        Long.MaxValue,
+        Long.MaxValue,
+        1),
+      0)
+    val unsafeProj = UnsafeProjection.create(Seq(BoundReference(0, LongType, false)))
+
+    {
+      // SPARK-16740
+      val keys = Seq(0L, Long.MaxValue, Long.MaxValue)
+      val map = new LongToUnsafeRowMap(taskMemoryManager, 1)
+      keys.foreach { k =>
+        map.append(k, unsafeProj(InternalRow(k)))
+      }
+      map.optimize()
+      val row = unsafeProj(InternalRow(0L)).copy()
+      keys.foreach { k =>
+        assert(map.getValue(k, row) eq row)
+        assert(row.getLong(0) === k)
+      }
+      map.free()
+    }
+
+
+    {
+      // SPARK-16802
+      val keys = Seq(Long.MaxValue, Long.MaxValue - 10)
+      val map = new LongToUnsafeRowMap(taskMemoryManager, 1)
+      keys.foreach { k =>
+        map.append(k, unsafeProj(InternalRow(k)))
+      }
+      map.optimize()
+      val row = unsafeProj(InternalRow(0L)).copy()
+      keys.foreach { k =>
+        assert(map.getValue(k, row) eq row)
+        assert(row.getLong(0) === k)
+      }
+      assert(map.getValue(Long.MinValue, row) eq null)
+      map.free()
+    }
+  }
+
+  test("LongToUnsafeRowMap with random keys") {
+    val taskMemoryManager = new TaskMemoryManager(
+      new StaticMemoryManager(
+        new SparkConf().set(MEMORY_OFFHEAP_ENABLED.key, "false"),
+        Long.MaxValue,
+        Long.MaxValue,
+        1),
+      0)
+    val unsafeProj = UnsafeProjection.create(Seq(BoundReference(0, LongType, false)))
+
+    val N = 1000000
+    val rand = new Random
+    val keys = (0 to N).map(x => rand.nextLong()).toArray
+
+    val map = new LongToUnsafeRowMap(taskMemoryManager, 10)
+    keys.foreach { k =>
+      map.append(k, unsafeProj(InternalRow(k)))
+    }
+    map.optimize()
+
+    val os = new ByteArrayOutputStream()
+    val out = new ObjectOutputStream(os)
+    map.writeExternal(out)
+    out.flush()
+    val in = new ObjectInputStream(new ByteArrayInputStream(os.toByteArray))
+    val map2 = new LongToUnsafeRowMap(taskMemoryManager, 1)
+    map2.readExternal(in)
+
+    val row = unsafeProj(InternalRow(0L)).copy()
+    keys.foreach { k =>
+      val r = map2.get(k, row)
+      assert(r.hasNext)
+      var c = 0
+      while (r.hasNext) {
+        val rr = r.next()
+        assert(rr.getLong(0) === k)
+        c += 1
+      }
+    }
+    var i = 0
+    while (i < N * 10) {
+      val k = rand.nextLong()
+      val r = map2.get(k, row)
+      if (r != null) {
+        assert(r.hasNext)
+        while (r.hasNext) {
+          assert(r.next().getLong(0) === k)
+        }
+      }
+      i += 1
+    }
+    map.free()
+  }
+
+  test("SPARK-24257: insert big values into LongToUnsafeRowMap") {
+    val taskMemoryManager = new TaskMemoryManager(
+      new StaticMemoryManager(
+        new SparkConf().set(MEMORY_OFFHEAP_ENABLED.key, "false"),
+        Long.MaxValue,
+        Long.MaxValue,
+        1),
+      0)
+    val unsafeProj = UnsafeProjection.create(Array[DataType](StringType))
+    val map = new LongToUnsafeRowMap(taskMemoryManager, 1)
+
+    val key = 0L
+    // the page array is initialized with length 1 << 17 (1M bytes),
+    // so here we need a value larger than 1 << 18 (2M bytes), to trigger the bug
+    val bigStr = UTF8String.fromString("x" * (1 << 19))
+
+    map.append(key, unsafeProj(InternalRow(bigStr)))
+    map.optimize()
+
+    val resultRow = new UnsafeRow(1)
+    assert(map.getValue(key, resultRow).getUTF8String(0) === bigStr)
+    map.free()
   }
 
   test("Spark-14521") {

@@ -25,7 +25,7 @@ import scala.collection.JavaConverters._
 import com.google.common.io.Files
 
 import org.apache.spark.{SecurityManager, SparkConf}
-import org.apache.spark.deploy.{ApplicationDescription, ExecutorState}
+import org.apache.spark.deploy.{ApplicationDescription, Command, ExecutorState}
 import org.apache.spark.deploy.DeployMessages.ExecutorStateChanged
 import org.apache.spark.internal.Logging
 import org.apache.spark.rpc.RpcEndpointRef
@@ -142,7 +142,11 @@ private[deploy] class ExecutorRunner(
   private def fetchAndRunExecutor() {
     try {
       // Launch the process
-      val builder = CommandUtils.buildProcessBuilder(appDesc.command, new SecurityManager(conf),
+      val subsOpts = appDesc.command.javaOpts.map {
+        Utils.substituteAppNExecIds(_, appId, execId.toString)
+      }
+      val subsCommand = appDesc.command.copy(javaOpts = subsOpts)
+      val builder = CommandUtils.buildProcessBuilder(subsCommand, new SecurityManager(conf),
         memory, sparkHome.getAbsolutePath, substituteVariables)
       val command = builder.command()
       val formattedCommand = command.asScala.mkString("\"", "\" \"", "\"")
@@ -156,7 +160,11 @@ private[deploy] class ExecutorRunner(
 
       // Add webUI log urls
       val baseUrl =
-        s"http://$publicAddress:$webUiPort/logPage/?appId=$appId&executorId=$execId&logType="
+        if (conf.getBoolean("spark.ui.reverseProxy", false)) {
+          s"/proxy/$workerId/logPage/?appId=$appId&executorId=$execId&logType="
+        } else {
+          s"http://$publicAddress:$webUiPort/logPage/?appId=$appId&executorId=$execId&logType="
+        }
       builder.environment.put("SPARK_LOG_URL_STDERR", s"${baseUrl}stderr")
       builder.environment.put("SPARK_LOG_URL_STDOUT", s"${baseUrl}stdout")
 

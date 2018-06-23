@@ -23,7 +23,7 @@ run tasks and store data for that application. If multiple users need to share y
 different options to manage allocation, depending on the cluster manager.
 
 The simplest option, available on all cluster managers, is _static partitioning_ of resources. With
-this approach, each application is given a maximum amount of resources it can use, and holds onto them
+this approach, each application is given a maximum amount of resources it can use and holds onto them
 for its whole duration. This is the approach used in Spark's [standalone](spark-standalone.html)
 and [YARN](running-on-yarn.html) modes, as well as the
 [coarse-grained Mesos mode](running-on-mesos.html#mesos-run-modes).
@@ -83,18 +83,7 @@ In Mesos coarse-grained mode, run `$SPARK_HOME/sbin/start-mesos-shuffle-service.
 slave nodes with `spark.shuffle.service.enabled` set to `true`. For instance, you may do so
 through Marathon.
 
-In YARN mode, start the shuffle service on each `NodeManager` as follows:
-
-1. Build Spark with the [YARN profile](building-spark.html). Skip this step if you are using a
-pre-packaged distribution.
-2. Locate the `spark-<version>-yarn-shuffle.jar`. This should be under
-`$SPARK_HOME/common/network-yarn/target/scala-<version>` if you are building Spark yourself, and under
-`lib` if you are using a distribution.
-2. Add this jar to the classpath of all `NodeManager`s in your cluster.
-3. In the `yarn-site.xml` on each node, add `spark_shuffle` to `yarn.nodemanager.aux-services`,
-then set `yarn.nodemanager.aux-services.spark_shuffle.class` to
-`org.apache.spark.network.yarn.YarnShuffleService`.
-4. Restart all `NodeManager`s in your cluster.
+In YARN mode, follow the instructions [here](running-on-yarn.html#configuring-the-external-shuffle-service).
 
 All other relevant configurations are optional and under the `spark.dynamicAllocation.*` and
 `spark.shuffle.service.*` namespaces. For more detail, see the
@@ -241,12 +230,12 @@ properties:
 * `minShare`: Apart from an overall weight, each pool can be given a _minimum shares_ (as a number of
   CPU cores) that the administrator would like it to have. The fair scheduler always attempts to meet
   all active pools' minimum shares before redistributing extra resources according to the weights.
-  The `minShare` property can therefore be another way to ensure that a pool can always get up to a
+  The `minShare` property can, therefore, be another way to ensure that a pool can always get up to a
   certain number of resources (e.g. 10 cores) quickly without giving it a high priority for the rest
   of the cluster. By default, each pool's `minShare` is 0.
 
 The pool properties can be set by creating an XML file, similar to `conf/fairscheduler.xml.template`,
-and setting a `spark.scheduler.allocation.file` property in your
+and either putting a file named `fairscheduler.xml` on the classpath, or setting `spark.scheduler.allocation.file` property in your
 [SparkConf](configuration.html#spark-properties).
 
 {% highlight scala %}

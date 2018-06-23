@@ -17,14 +17,37 @@
 
 package org.apache.spark.sql
 
-import scala.language.postfixOps
+import org.scalatest.concurrent.TimeLimits
+import org.scalatest.time.SpanSugar._
 
+import org.apache.spark.sql.execution.columnar.{InMemoryRelation, InMemoryTableScanExec}
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.test.SharedSQLContext
+import org.apache.spark.storage.StorageLevel
 
 
-class DatasetCacheSuite extends QueryTest with SharedSQLContext {
+class DatasetCacheSuite extends QueryTest with SharedSQLContext with TimeLimits {
   import testImplicits._
+
+  test("get storage level") {
+    val ds1 = Seq("1", "2").toDS().as("a")
+    val ds2 = Seq(2, 3).toDS().as("b")
+
+    // default storage level
+    ds1.persist()
+    ds2.cache()
+    assert(ds1.storageLevel == StorageLevel.MEMORY_AND_DISK)
+    assert(ds2.storageLevel == StorageLevel.MEMORY_AND_DISK)
+    // unpersist
+    ds1.unpersist()
+    assert(ds1.storageLevel == StorageLevel.NONE)
+    // non-default storage level
+    ds1.persist(StorageLevel.MEMORY_ONLY_2)
+    assert(ds1.storageLevel == StorageLevel.MEMORY_ONLY_2)
+    // joined Dataset should not be persisted
+    val joined = ds1.joinWith(ds2, $"a.value" === $"b.value")
+    assert(joined.storageLevel == StorageLevel.NONE)
+  }
 
   test("persist and unpersist") {
     val ds = Seq(("a", 1), ("b", 2), ("c", 3)).toDS().select(expr("_2 + 1").as[Int])
@@ -39,8 +62,7 @@ class DatasetCacheSuite extends QueryTest with SharedSQLContext {
       2, 3, 4)
     // Drop the cache.
     cached.unpersist()
-    assert(spark.sharedState.cacheManager.lookupCachedData(cached).isEmpty,
-      "The Dataset should not be cached.")
+    assert(cached.storageLevel == StorageLevel.NONE, "The Dataset should not be cached.")
   }
 
   test("persist and then rebind right encoder when join 2 datasets") {
@@ -57,11 +79,9 @@ class DatasetCacheSuite extends QueryTest with SharedSQLContext {
     assertCached(joined, 2)
 
     ds1.unpersist()
-    assert(spark.sharedState.cacheManager.lookupCachedData(ds1).isEmpty,
-      "The Dataset ds1 should not be cached.")
+    assert(ds1.storageLevel == StorageLevel.NONE, "The Dataset ds1 should not be cached.")
     ds2.unpersist()
-    assert(spark.sharedState.cacheManager.lookupCachedData(ds2).isEmpty,
-      "The Dataset ds2 should not be cached.")
+    assert(ds2.storageLevel == StorageLevel.NONE, "The Dataset ds2 should not be cached.")
   }
 
   test("persist and then groupBy columns asKey, map") {
@@ -76,10 +96,56 @@ class DatasetCacheSuite extends QueryTest with SharedSQLContext {
     assertCached(agged.filter(_._1 == "b"))
 
     ds.unpersist()
-    assert(spark.sharedState.cacheManager.lookupCachedData(ds).isEmpty,
-      "The Dataset ds should not be cached.")
+    assert(ds.storageLevel == StorageLevel.NONE, "The Dataset ds should not be cached.")
     agged.unpersist()
-    assert(spark.sharedState.cacheManager.lookupCachedData(agged).isEmpty,
-      "The Dataset agged should not be cached.")
+    assert(agged.storageLevel == StorageLevel.NONE, "The Dataset agged should not be cached.")
+  }
+
+  test("persist and then withColumn") {
+    val df = Seq(("test", 1)).toDF("s", "i")
+    val df2 = df.withColumn("newColumn", lit(1))
+
+    df.cache()
+    assertCached(df)
+    assertCached(df2)
+
+    df.count()
+    assertCached(df2)
+
+    df.unpersist()
+    assert(df.storageLevel == StorageLevel.NONE)
+  }
+
+  test("cache UDF result correctly") {
+    val expensiveUDF = udf({x: Int => Thread.sleep(10000); x})
+    val df = spark.range(0, 10).toDF("a").withColumn("b", expensiveUDF($"a"))
+    val df2 = df.agg(sum(df("b")))
+
+    df.cache()
+    df.count()
+    assertCached(df2)
+
+    // udf has been evaluated during caching, and thus should not be re-evaluated here
+    failAfter(5 seconds) {
+      df2.collect()
+    }
+
+    df.unpersist()
+    assert(df.storageLevel == StorageLevel.NONE)
+  }
+
+  test("SPARK-24613 Cache with UDF could not be matched with subsequent dependent caches") {
+    val udf1 = udf({x: Int => x + 1})
+    val df = spark.range(0, 10).toDF("a").withColumn("b", udf1($"a"))
+    val df2 = df.agg(sum(df("b")))
+
+    df.cache()
+    df.count()
+    df2.cache()
+
+    val plan = df2.queryExecution.withCachedData
+    assert(plan.isInstanceOf[InMemoryRelation])
+    val internalPlan = plan.asInstanceOf[InMemoryRelation].cacheBuilder.cachedPlan
+    assert(internalPlan.find(_.isInstanceOf[InMemoryTableScanExec]).isDefined)
   }
 }

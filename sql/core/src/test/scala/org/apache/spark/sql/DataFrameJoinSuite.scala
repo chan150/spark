@@ -21,6 +21,7 @@ import org.apache.spark.sql.catalyst.plans.{Inner, LeftOuter, RightOuter}
 import org.apache.spark.sql.catalyst.plans.logical.Join
 import org.apache.spark.sql.execution.joins.BroadcastHashJoinExec
 import org.apache.spark.sql.functions._
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSQLContext
 
 class DataFrameJoinSuite extends QueryTest with SharedSQLContext {
@@ -104,6 +105,21 @@ class DataFrameJoinSuite extends QueryTest with SharedSQLContext {
         .collect().toSeq)
   }
 
+  test("join - cross join") {
+    val df1 = Seq((1, "1"), (3, "3")).toDF("int", "str")
+    val df2 = Seq((2, "2"), (4, "4")).toDF("int", "str")
+
+    checkAnswer(
+      df1.crossJoin(df2),
+      Row(1, "1", 2, "2") :: Row(1, "1", 4, "4") ::
+        Row(3, "3", 2, "2") :: Row(3, "3", 4, "4") :: Nil)
+
+    checkAnswer(
+      df2.crossJoin(df1),
+      Row(2, "2", 1, "1") :: Row(2, "2", 3, "3") ::
+        Row(4, "4", 1, "1") :: Row(4, "4", 3, "3") :: Nil)
+  }
+
   test("join - using aliases after self join") {
     val df = Seq(1, 2, 3).map(i => (i, i.toString)).toDF("int", "str")
     checkAnswer(
@@ -136,7 +152,7 @@ class DataFrameJoinSuite extends QueryTest with SharedSQLContext {
       Row(1, 1, 1, 1) :: Row(2, 1, 2, 2) :: Nil)
   }
 
-  test("broadcast join hint") {
+  test("broadcast join hint using broadcast function") {
     val df1 = Seq((1, "1"), (2, "2")).toDF("key", "value")
     val df2 = Seq((1, "1"), (2, "2")).toDF("key", "value")
 
@@ -145,7 +161,7 @@ class DataFrameJoinSuite extends QueryTest with SharedSQLContext {
     assert(plan1.collect { case p: BroadcastHashJoinExec => p }.size === 1)
 
     // no join key -- should not be a broadcast join
-    val plan2 = df1.join(broadcast(df2)).queryExecution.sparkPlan
+    val plan2 = df1.crossJoin(broadcast(df2)).queryExecution.sparkPlan
     assert(plan2.collect { case p: BroadcastHashJoinExec => p }.size === 0)
 
     // planner should not crash without a join
@@ -155,8 +171,24 @@ class DataFrameJoinSuite extends QueryTest with SharedSQLContext {
     withTempPath { path =>
       df1.write.parquet(path.getCanonicalPath)
       val pf1 = spark.read.parquet(path.getCanonicalPath)
-      assert(df1.join(broadcast(pf1)).count() === 4)
+      assert(df1.crossJoin(broadcast(pf1)).count() === 4)
     }
+  }
+
+  test("broadcast join hint using Dataset.hint") {
+    // make sure a giant join is not broadcastable
+    val plan1 =
+      spark.range(10e10.toLong)
+        .join(spark.range(10e10.toLong), "id")
+        .queryExecution.executedPlan
+    assert(plan1.collect { case p: BroadcastHashJoinExec => p }.size == 0)
+
+    // now with a hint it should be broadcasted
+    val plan2 =
+      spark.range(10e10.toLong)
+        .join(spark.range(10e10.toLong).hint("broadcast"), "id")
+        .queryExecution.executedPlan
+    assert(plan2.collect { case p: BroadcastHashJoinExec => p }.size == 1)
   }
 
   test("join - outer join conversion") {
@@ -224,5 +256,35 @@ class DataFrameJoinSuite extends QueryTest with SharedSQLContext {
         .select(coalesce(df3("a"), df3("b")), coalesce(df4("a"), df4("b"))),
       Row(1, null) :: Row(null, 2) :: Nil
     )
+  }
+
+  test("SPARK-16991: Full outer join followed by inner join produces wrong results") {
+    val a = Seq((1, 2), (2, 3)).toDF("a", "b")
+    val b = Seq((2, 5), (3, 4)).toDF("a", "c")
+    val c = Seq((3, 1)).toDF("a", "d")
+    val ab = a.join(b, Seq("a"), "fullouter")
+    checkAnswer(ab.join(c, "a"), Row(3, null, 4, 1) :: Nil)
+  }
+
+  test("SPARK-17685: WholeStageCodegenExec throws IndexOutOfBoundsException") {
+    val df = Seq((1, 1, "1"), (2, 2, "3")).toDF("int", "int2", "str")
+    val df2 = Seq((1, 1, "1"), (2, 3, "5")).toDF("int", "int2", "str")
+    val limit = 1310721
+    val innerJoin = df.limit(limit).join(df2.limit(limit), Seq("int", "int2"), "inner")
+      .agg(count($"int"))
+    checkAnswer(innerJoin, Row(1) :: Nil)
+  }
+
+  test("SPARK-23087: don't throw Analysis Exception in CheckCartesianProduct when join condition " +
+    "is false or null") {
+    withSQLConf(SQLConf.CROSS_JOINS_ENABLED.key -> "false") {
+      val df = spark.range(10)
+      val dfNull = spark.range(10).select(lit(null).as("b"))
+      df.join(dfNull, $"id" === $"b", "left").queryExecution.optimizedPlan
+
+      val dfOne = df.select(lit(1).as("a"))
+      val dfTwo = spark.range(10).select(lit(2).as("b"))
+      dfOne.join(dfTwo, $"a" === $"b", "left").queryExecution.optimizedPlan
+    }
   }
 }

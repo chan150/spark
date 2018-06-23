@@ -37,12 +37,13 @@ import org.apache.spark.sql.types._
  *  - Xiangrui Meng.  "Simpler Online Updates for Arbitrary-Order Central Moments."
  *      2015. http://arxiv.org/abs/1510.04923
  *
- * @see [[https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance
- *     Algorithms for calculating variance (Wikipedia)]]
+ * @see <a href="https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance">
+ * Algorithms for calculating variance (Wikipedia)</a>
  *
  * @param child to compute central moments of.
  */
-abstract class CentralMomentAgg(child: Expression) extends DeclarativeAggregate {
+abstract class CentralMomentAgg(child: Expression)
+  extends DeclarativeAggregate with ImplicitCastInputTypes {
 
   /**
    * The central moment order to be computed.
@@ -66,35 +67,7 @@ abstract class CentralMomentAgg(child: Expression) extends DeclarativeAggregate 
 
   override val initialValues: Seq[Expression] = Array.fill(momentOrder + 1)(Literal(0.0))
 
-  override val updateExpressions: Seq[Expression] = {
-    val newN = n + Literal(1.0)
-    val delta = child - avg
-    val deltaN = delta / newN
-    val newAvg = avg + deltaN
-    val newM2 = m2 + delta * (delta - deltaN)
-
-    val delta2 = delta * delta
-    val deltaN2 = deltaN * deltaN
-    val newM3 = if (momentOrder >= 3) {
-      m3 - Literal(3.0) * deltaN * newM2 + delta * (delta2 - deltaN2)
-    } else {
-      Literal(0.0)
-    }
-    val newM4 = if (momentOrder >= 4) {
-      m4 - Literal(4.0) * deltaN * newM3 - Literal(6.0) * deltaN2 * newM2 +
-        delta * (delta * delta2 - deltaN * deltaN2)
-    } else {
-      Literal(0.0)
-    }
-
-    trimHigherOrder(Seq(
-      If(IsNull(child), n, newN),
-      If(IsNull(child), avg, newAvg),
-      If(IsNull(child), m2, newM2),
-      If(IsNull(child), m3, newM3),
-      If(IsNull(child), m4, newM4)
-    ))
-  }
+  override lazy val updateExpressions: Seq[Expression] = updateExpressionsDef
 
   override val mergeExpressions: Seq[Expression] = {
 
@@ -127,12 +100,42 @@ abstract class CentralMomentAgg(child: Expression) extends DeclarativeAggregate 
 
     trimHigherOrder(Seq(newN, newAvg, newM2, newM3, newM4))
   }
+
+  protected def updateExpressionsDef: Seq[Expression] = {
+    val newN = n + Literal(1.0)
+    val delta = child - avg
+    val deltaN = delta / newN
+    val newAvg = avg + deltaN
+    val newM2 = m2 + delta * (delta - deltaN)
+
+    val delta2 = delta * delta
+    val deltaN2 = deltaN * deltaN
+    val newM3 = if (momentOrder >= 3) {
+      m3 - Literal(3.0) * deltaN * newM2 + delta * (delta2 - deltaN2)
+    } else {
+      Literal(0.0)
+    }
+    val newM4 = if (momentOrder >= 4) {
+      m4 - Literal(4.0) * deltaN * newM3 - Literal(6.0) * deltaN2 * newM2 +
+        delta * (delta * delta2 - deltaN * deltaN2)
+    } else {
+      Literal(0.0)
+    }
+
+    trimHigherOrder(Seq(
+      If(IsNull(child), n, newN),
+      If(IsNull(child), avg, newAvg),
+      If(IsNull(child), m2, newM2),
+      If(IsNull(child), m3, newM3),
+      If(IsNull(child), m4, newM4)
+    ))
+  }
 }
 
 // Compute the population standard deviation of a column
 // scalastyle:off line.size.limit
 @ExpressionDescription(
-  usage = "_FUNC_(x) - Returns the population standard deviation calculated from values of a group.")
+  usage = "_FUNC_(expr) - Returns the population standard deviation calculated from values of a group.")
 // scalastyle:on line.size.limit
 case class StddevPop(child: Expression) extends CentralMomentAgg(child) {
 
@@ -147,8 +150,10 @@ case class StddevPop(child: Expression) extends CentralMomentAgg(child) {
 }
 
 // Compute the sample standard deviation of a column
+// scalastyle:off line.size.limit
 @ExpressionDescription(
-  usage = "_FUNC_(x) - Returns the sample standard deviation calculated from values of a group.")
+  usage = "_FUNC_(expr) - Returns the sample standard deviation calculated from values of a group.")
+// scalastyle:on line.size.limit
 case class StddevSamp(child: Expression) extends CentralMomentAgg(child) {
 
   override protected def momentOrder = 2
@@ -164,7 +169,7 @@ case class StddevSamp(child: Expression) extends CentralMomentAgg(child) {
 
 // Compute the population variance of a column
 @ExpressionDescription(
-  usage = "_FUNC_(x) - Returns the population variance calculated from values of a group.")
+  usage = "_FUNC_(expr) - Returns the population variance calculated from values of a group.")
 case class VariancePop(child: Expression) extends CentralMomentAgg(child) {
 
   override protected def momentOrder = 2
@@ -179,7 +184,7 @@ case class VariancePop(child: Expression) extends CentralMomentAgg(child) {
 
 // Compute the sample variance of a column
 @ExpressionDescription(
-  usage = "_FUNC_(x) - Returns the sample variance calculated from values of a group.")
+  usage = "_FUNC_(expr) - Returns the sample variance calculated from values of a group.")
 case class VarianceSamp(child: Expression) extends CentralMomentAgg(child) {
 
   override protected def momentOrder = 2
@@ -194,7 +199,7 @@ case class VarianceSamp(child: Expression) extends CentralMomentAgg(child) {
 }
 
 @ExpressionDescription(
-  usage = "_FUNC_(x) - Returns the Skewness value calculated from values of a group.")
+  usage = "_FUNC_(expr) - Returns the skewness value calculated from values of a group.")
 case class Skewness(child: Expression) extends CentralMomentAgg(child) {
 
   override def prettyName: String = "skewness"
@@ -209,7 +214,7 @@ case class Skewness(child: Expression) extends CentralMomentAgg(child) {
 }
 
 @ExpressionDescription(
-  usage = "_FUNC_(x) - Returns the Kurtosis value calculated from values of a group.")
+  usage = "_FUNC_(expr) - Returns the kurtosis value calculated from values of a group.")
 case class Kurtosis(child: Expression) extends CentralMomentAgg(child) {
 
   override protected def momentOrder = 4
