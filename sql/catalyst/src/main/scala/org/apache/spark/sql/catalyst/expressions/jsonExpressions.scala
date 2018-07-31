@@ -514,9 +514,10 @@ case class JsonToStructs(
     schema: DataType,
     options: Map[String, String],
     child: Expression,
-    timeZoneId: Option[String],
-    forceNullableSchema: Boolean)
+    timeZoneId: Option[String] = None)
   extends UnaryExpression with TimeZoneAwareExpression with CodegenFallback with ExpectsInputTypes {
+
+  val forceNullableSchema = SQLConf.get.getConf(SQLConf.FROM_JSON_FORCE_NULLABLE_SCHEMA)
 
   // The JSON input data might be missing certain fields. We force the nullability
   // of the user-provided schema to avoid data corruptions. In particular, the parquet-mr encoder
@@ -531,8 +532,7 @@ case class JsonToStructs(
       schema = JsonExprUtils.evalSchemaExpr(schema),
       options = options,
       child = child,
-      timeZoneId = None,
-      forceNullableSchema = SQLConf.get.getConf(SQLConf.FROM_JSON_FORCE_NULLABLE_SCHEMA))
+      timeZoneId = None)
 
   def this(child: Expression, schema: Expression) = this(child, schema, Map.empty[String, String])
 
@@ -541,19 +541,13 @@ case class JsonToStructs(
       schema = JsonExprUtils.evalSchemaExpr(schema),
       options = JsonExprUtils.convertToMapData(options),
       child = child,
-      timeZoneId = None,
-      forceNullableSchema = SQLConf.get.getConf(SQLConf.FROM_JSON_FORCE_NULLABLE_SCHEMA))
-
-  // Used in `org.apache.spark.sql.functions`
-  def this(schema: DataType, options: Map[String, String], child: Expression) =
-    this(schema, options, child, timeZoneId = None,
-      forceNullableSchema = SQLConf.get.getConf(SQLConf.FROM_JSON_FORCE_NULLABLE_SCHEMA))
+      timeZoneId = None)
 
   override def checkInputDataTypes(): TypeCheckResult = nullableSchema match {
     case _: StructType | ArrayType(_: StructType, _) | _: MapType =>
       super.checkInputDataTypes()
     case _ => TypeCheckResult.TypeCheckFailure(
-      s"Input schema ${nullableSchema.simpleString} must be a struct or an array of structs.")
+      s"Input schema ${nullableSchema.catalogString} must be a struct or an array of structs.")
   }
 
   @transient
@@ -735,7 +729,7 @@ case class StructsToJson(
           TypeCheckResult.TypeCheckFailure(e.getMessage)
       }
     case _ => TypeCheckResult.TypeCheckFailure(
-      s"Input type ${child.dataType.simpleString} must be a struct, array of structs or " +
+      s"Input type ${child.dataType.catalogString} must be a struct, array of structs or " +
           "a map or array of map.")
   }
 
@@ -796,7 +790,7 @@ object JsonExprUtils {
       }
     case m: CreateMap =>
       throw new AnalysisException(
-        s"A type of keys and values in map() must be string, but got ${m.dataType}")
+        s"A type of keys and values in map() must be string, but got ${m.dataType.catalogString}")
     case _ =>
       throw new AnalysisException("Must use a map() function for options")
   }

@@ -39,7 +39,21 @@ import org.apache.spark.util.Utils
 
 
 /**
- * Functions available for DataFrame operations.
+ * Commonly used functions available for DataFrame operations. Using functions defined here provides
+ * a little bit more compile-time safety to make sure the function exists.
+ *
+ * Spark also includes more built-in functions that are less common and are not defined here.
+ * You can still access them (and all the functions defined here) using the `functions.expr()` API
+ * and calling them through a SQL expression string. You can find the entire list of functions
+ * at SQL API documentation.
+ *
+ * As an example, `isnan` is a function that is defined here. You can use `isnan(col("myCol"))`
+ * to invoke the `isnan` function. This way the programming language's compiler ensures `isnan`
+ * exists and is of the proper form. You can also use `expr("isnan(myCol)")` function to invoke the
+ * same function. In this case, Spark itself will ensure `isnan` exists when it analyzes the query.
+ *
+ * `regr_count` is an example of a function that is built-in but not defined here, because it is
+ * less commonly used. To invoke it, use `expr("regr_count(yCol, xCol)")`.
  *
  * @groupname udf_funcs UDF functions
  * @groupname agg_funcs Aggregate functions
@@ -3204,6 +3218,7 @@ object functions {
 
   /**
    * Remove all elements that equal to element from the given array.
+   *
    * @group collection_funcs
    * @since 2.4.0
    */
@@ -3217,6 +3232,16 @@ object functions {
    * @since 2.4.0
    */
   def array_distinct(e: Column): Column = withExpr { ArrayDistinct(e.expr) }
+
+  /**
+   * Returns an array of the elements in the union of the given two arrays, without duplicates.
+   *
+   * @group collection_funcs
+   * @since 2.4.0
+   */
+  def array_union(col1: Column, col2: Column): Column = withExpr {
+    ArrayUnion(col1.expr, col2.expr)
+  }
 
   /**
    * Creates a new row for each element in the given array or map column.
@@ -3304,7 +3329,7 @@ object functions {
    * @since 2.2.0
    */
   def from_json(e: Column, schema: DataType, options: Map[String, String]): Column = withExpr {
-    new JsonToStructs(schema, options, e.expr)
+    JsonToStructs(schema, options, e.expr)
   }
 
   /**
@@ -3495,7 +3520,7 @@ object functions {
    * @group collection_funcs
    * @since 1.5.0
    */
-  def size(e: Column): Column = withExpr { new Size(e.expr) }
+  def size(e: Column): Column = withExpr { Size(e.expr) }
 
   /**
    * Sorts the input array for the given column in ascending order,
@@ -3533,6 +3558,16 @@ object functions {
    * @since 2.4.0
    */
   def array_max(e: Column): Column = withExpr { ArrayMax(e.expr) }
+
+  /**
+   * Returns a random permutation of the given array.
+   *
+   * @note The function is non-deterministic.
+   *
+   * @group collection_funcs
+   * @since 2.4.0
+   */
+  def shuffle(e: Column): Column = withExpr { Shuffle(e.expr) }
 
   /**
    * Returns a reversed string or an array with reverse order of elements.
@@ -3627,124 +3662,13 @@ object functions {
   @scala.annotation.varargs
   def arrays_zip(e: Column*): Column = withExpr { ArraysZip(e.map(_.expr)) }
 
-  //////////////////////////////////////////////////////////////////////////////////////////////
-  // Mask functions
-  //////////////////////////////////////////////////////////////////////////////////////////////
   /**
-   * Returns a string which is the masked representation of the input.
-   * @group mask_funcs
+   * Returns the union of all the given maps.
+   * @group collection_funcs
    * @since 2.4.0
    */
-  def mask(e: Column): Column = withExpr { new Mask(e.expr) }
-
-  /**
-   * Returns a string which is the masked representation of the input, using `upper`, `lower` and
-   * `digit` as replacement characters.
-   * @group mask_funcs
-   * @since 2.4.0
-   */
-  def mask(e: Column, upper: String, lower: String, digit: String): Column = withExpr {
-    Mask(e.expr, upper, lower, digit)
-  }
-
-  /**
-   * Returns a string with the first `n` characters masked.
-   * @group mask_funcs
-   * @since 2.4.0
-   */
-  def mask_first_n(e: Column, n: Int): Column = withExpr { new MaskFirstN(e.expr, Literal(n)) }
-
-  /**
-   * Returns a string with the first `n` characters masked, using `upper`, `lower` and `digit` as
-   * replacement characters.
-   * @group mask_funcs
-   * @since 2.4.0
-   */
-  def mask_first_n(
-      e: Column,
-      n: Int,
-      upper: String,
-      lower: String,
-      digit: String): Column = withExpr {
-    MaskFirstN(e.expr, n, upper, lower, digit)
-  }
-
-  /**
-   * Returns a string with the last `n` characters masked.
-   * @group mask_funcs
-   * @since 2.4.0
-   */
-  def mask_last_n(e: Column, n: Int): Column = withExpr { new MaskLastN(e.expr, Literal(n)) }
-
-  /**
-   * Returns a string with the last `n` characters masked, using `upper`, `lower` and `digit` as
-   * replacement characters.
-   * @group mask_funcs
-   * @since 2.4.0
-   */
-  def mask_last_n(
-      e: Column,
-      n: Int,
-      upper: String,
-      lower: String,
-      digit: String): Column = withExpr {
-    MaskLastN(e.expr, n, upper, lower, digit)
-  }
-
-  /**
-   * Returns a string with all but the first `n` characters masked.
-   * @group mask_funcs
-   * @since 2.4.0
-   */
-  def mask_show_first_n(e: Column, n: Int): Column = withExpr {
-    new MaskShowFirstN(e.expr, Literal(n))
-  }
-
-  /**
-   * Returns a string with all but the first `n` characters masked, using `upper`, `lower` and
-   * `digit` as replacement characters.
-   * @group mask_funcs
-   * @since 2.4.0
-   */
-  def mask_show_first_n(
-      e: Column,
-      n: Int,
-      upper: String,
-      lower: String,
-      digit: String): Column = withExpr {
-    MaskShowFirstN(e.expr, n, upper, lower, digit)
-  }
-
-  /**
-   * Returns a string with all but the last `n` characters masked.
-   * @group mask_funcs
-   * @since 2.4.0
-   */
-  def mask_show_last_n(e: Column, n: Int): Column = withExpr {
-    new MaskShowLastN(e.expr, Literal(n))
-  }
-
-  /**
-   * Returns a string with all but the last `n` characters masked, using `upper`, `lower` and
-   * `digit` as replacement characters.
-   * @group mask_funcs
-   * @since 2.4.0
-   */
-  def mask_show_last_n(
-      e: Column,
-      n: Int,
-      upper: String,
-      lower: String,
-      digit: String): Column = withExpr {
-    MaskShowLastN(e.expr, n, upper, lower, digit)
-  }
-
-  /**
-   * Returns a hashed value based on the input column.
-   * @group mask_funcs
-   * @since 2.4.0
-   */
-  def mask_hash(e: Column): Column = withExpr { MaskHash(e.expr) }
+  @scala.annotation.varargs
+  def map_concat(cols: Column*): Column = withExpr { MapConcat(cols.map(_.expr)) }
 
   // scalastyle:off line.size.limit
   // scalastyle:off parameter.number
