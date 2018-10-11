@@ -257,12 +257,43 @@ class TypeCoercionSuite extends AnalysisTest {
     shouldNotCast(checkedType, IntegralType)
   }
 
-  test("implicit type cast - MapType(StringType, StringType)") {
-    val checkedType = MapType(StringType, StringType)
-    checkTypeCasting(checkedType, castableTypes = Seq(checkedType))
-    shouldNotCast(checkedType, DecimalType)
-    shouldNotCast(checkedType, NumericType)
-    shouldNotCast(checkedType, IntegralType)
+  test("implicit type cast between two Map types") {
+    val sourceType = MapType(IntegerType, IntegerType, true)
+    val castableTypes = numericTypes ++ Seq(StringType).filter(!Cast.forceNullable(IntegerType, _))
+    val targetTypes = numericTypes.filter(!Cast.forceNullable(IntegerType, _)).map { t =>
+      MapType(t, sourceType.valueType, valueContainsNull = true)
+    }
+    val nonCastableTargetTypes = allTypes.filterNot(castableTypes.contains(_)).map {t =>
+      MapType(t, sourceType.valueType, valueContainsNull = true)
+    }
+
+    // Tests that its possible to setup implicit casts between two map types when
+    // source map's key type is integer and the target map's key type are either Byte, Short,
+    // Long, Double, Float, Decimal(38, 18) or String.
+    targetTypes.foreach { targetType =>
+      shouldCast(sourceType, targetType, targetType)
+    }
+
+    // Tests that its not possible to setup implicit casts between two map types when
+    // source map's key type is integer and the target map's key type are either Binary,
+    // Boolean, Date, Timestamp, Array, Struct, CaleandarIntervalType or NullType
+    nonCastableTargetTypes.foreach { targetType =>
+      shouldNotCast(sourceType, targetType)
+    }
+
+    // Tests that its not possible to cast from nullable map type to not nullable map type.
+    val targetNotNullableTypes = allTypes.filterNot(_ == IntegerType).map { t =>
+      MapType(t, sourceType.valueType, valueContainsNull = false)
+    }
+    val sourceMapExprWithValueNull =
+      CreateMap(Seq(Literal.default(sourceType.keyType),
+        Literal.create(null, sourceType.valueType)))
+    targetNotNullableTypes.foreach { targetType =>
+      val castDefault =
+        TypeCoercion.ImplicitTypeCasts.implicitCast(sourceMapExprWithValueNull, targetType)
+      assert(castDefault.isEmpty,
+        s"Should not be able to cast $sourceType to $targetType, but got $castDefault")
+    }
   }
 
   test("implicit type cast - StructType().add(\"a1\", StringType)") {
@@ -499,6 +530,14 @@ class TypeCoercionSuite extends AnalysisTest {
       ArrayType(new StructType().add("num", ShortType), containsNull = false),
       ArrayType(new StructType().add("num", LongType), containsNull = false),
       Some(ArrayType(new StructType().add("num", LongType), containsNull = false)))
+    widenTestWithStringPromotion(
+      ArrayType(IntegerType, containsNull = false),
+      ArrayType(DecimalType.IntDecimal, containsNull = false),
+      Some(ArrayType(DecimalType.IntDecimal, containsNull = false)))
+    widenTestWithStringPromotion(
+      ArrayType(DecimalType(36, 0), containsNull = false),
+      ArrayType(DecimalType(36, 35), containsNull = false),
+      Some(ArrayType(DecimalType(38, 35), containsNull = true)))
 
     // MapType
     widenTestWithStringPromotion(
@@ -517,6 +556,22 @@ class TypeCoercionSuite extends AnalysisTest {
       MapType(IntegerType, new StructType().add("num", ShortType), valueContainsNull = false),
       MapType(LongType, new StructType().add("num", LongType), valueContainsNull = false),
       Some(MapType(LongType, new StructType().add("num", LongType), valueContainsNull = false)))
+    widenTestWithStringPromotion(
+      MapType(StringType, IntegerType, valueContainsNull = false),
+      MapType(StringType, DecimalType.IntDecimal, valueContainsNull = false),
+      Some(MapType(StringType, DecimalType.IntDecimal, valueContainsNull = false)))
+    widenTestWithStringPromotion(
+      MapType(StringType, DecimalType(36, 0), valueContainsNull = false),
+      MapType(StringType, DecimalType(36, 35), valueContainsNull = false),
+      Some(MapType(StringType, DecimalType(38, 35), valueContainsNull = true)))
+    widenTestWithStringPromotion(
+      MapType(IntegerType, StringType, valueContainsNull = false),
+      MapType(DecimalType.IntDecimal, StringType, valueContainsNull = false),
+      Some(MapType(DecimalType.IntDecimal, StringType, valueContainsNull = false)))
+    widenTestWithStringPromotion(
+      MapType(DecimalType(36, 0), StringType, valueContainsNull = false),
+      MapType(DecimalType(36, 35), StringType, valueContainsNull = false),
+      None)
 
     // StructType
     widenTestWithStringPromotion(
@@ -540,6 +595,14 @@ class TypeCoercionSuite extends AnalysisTest {
         .add("map", MapType(DoubleType, StringType, valueContainsNull = false), nullable = false),
       Some(new StructType()
         .add("map", MapType(DoubleType, StringType, valueContainsNull = true), nullable = false)))
+    widenTestWithStringPromotion(
+      new StructType().add("num", IntegerType, nullable = false),
+      new StructType().add("num", DecimalType.IntDecimal, nullable = false),
+      Some(new StructType().add("num", DecimalType.IntDecimal, nullable = false)))
+    widenTestWithStringPromotion(
+      new StructType().add("num", DecimalType(36, 0), nullable = false),
+      new StructType().add("num", DecimalType(36, 35), nullable = false),
+      Some(new StructType().add("num", DecimalType(38, 35), nullable = true)))
 
     widenTestWithStringPromotion(
       new StructType().add("num", IntegerType),
@@ -648,11 +711,11 @@ class TypeCoercionSuite extends AnalysisTest {
   test("cast NullType for expressions that implement ExpectsInputTypes") {
     import TypeCoercionSuite._
 
-    ruleTest(new TypeCoercion.ImplicitTypeCasts(conf),
+    ruleTest(TypeCoercion.ImplicitTypeCasts,
       AnyTypeUnaryExpression(Literal.create(null, NullType)),
       AnyTypeUnaryExpression(Literal.create(null, NullType)))
 
-    ruleTest(new TypeCoercion.ImplicitTypeCasts(conf),
+    ruleTest(TypeCoercion.ImplicitTypeCasts,
       NumericTypeUnaryExpression(Literal.create(null, NullType)),
       NumericTypeUnaryExpression(Literal.create(null, DoubleType)))
   }
@@ -660,11 +723,11 @@ class TypeCoercionSuite extends AnalysisTest {
   test("cast NullType for binary operators") {
     import TypeCoercionSuite._
 
-    ruleTest(new TypeCoercion.ImplicitTypeCasts(conf),
+    ruleTest(TypeCoercion.ImplicitTypeCasts,
       AnyTypeBinaryOperator(Literal.create(null, NullType), Literal.create(null, NullType)),
       AnyTypeBinaryOperator(Literal.create(null, NullType), Literal.create(null, NullType)))
 
-    ruleTest(new TypeCoercion.ImplicitTypeCasts(conf),
+    ruleTest(TypeCoercion.ImplicitTypeCasts,
       NumericTypeBinaryOperator(Literal.create(null, NullType), Literal.create(null, NullType)),
       NumericTypeBinaryOperator(Literal.create(null, DoubleType), Literal.create(null, DoubleType)))
   }
@@ -944,7 +1007,7 @@ class TypeCoercionSuite extends AnalysisTest {
   }
 
   test("type coercion for CaseKeyWhen") {
-    ruleTest(new TypeCoercion.ImplicitTypeCasts(conf),
+    ruleTest(TypeCoercion.ImplicitTypeCasts,
       CaseKeyWhen(Literal(1.toShort), Seq(Literal(1), Literal("a"))),
       CaseKeyWhen(Cast(Literal(1.toShort), IntegerType), Seq(Literal(1), Literal("a")))
     )
@@ -1223,8 +1286,10 @@ class TypeCoercionSuite extends AnalysisTest {
 
     val expectedTypes = Seq(StringType, DecimalType.SYSTEM_DEFAULT, FloatType, DoubleType)
 
-    val r1 = widenSetOperationTypes(Except(firstTable, secondTable)).asInstanceOf[Except]
-    val r2 = widenSetOperationTypes(Intersect(firstTable, secondTable)).asInstanceOf[Intersect]
+    val r1 = widenSetOperationTypes(
+      Except(firstTable, secondTable, isAll = false)).asInstanceOf[Except]
+    val r2 = widenSetOperationTypes(
+      Intersect(firstTable, secondTable, isAll = false)).asInstanceOf[Intersect]
     checkOutput(r1.left, expectedTypes)
     checkOutput(r1.right, expectedTypes)
     checkOutput(r2.left, expectedTypes)
@@ -1289,8 +1354,10 @@ class TypeCoercionSuite extends AnalysisTest {
     val expectedType1 = Seq(DecimalType(10, 8))
 
     val r1 = widenSetOperationTypes(Union(left1, right1)).asInstanceOf[Union]
-    val r2 = widenSetOperationTypes(Except(left1, right1)).asInstanceOf[Except]
-    val r3 = widenSetOperationTypes(Intersect(left1, right1)).asInstanceOf[Intersect]
+    val r2 = widenSetOperationTypes(
+      Except(left1, right1, isAll = false)).asInstanceOf[Except]
+    val r3 = widenSetOperationTypes(
+      Intersect(left1, right1, isAll = false)).asInstanceOf[Intersect]
 
     checkOutput(r1.children.head, expectedType1)
     checkOutput(r1.children.last, expectedType1)
@@ -1310,16 +1377,20 @@ class TypeCoercionSuite extends AnalysisTest {
         AttributeReference("r", rType)())
 
       val r1 = widenSetOperationTypes(Union(plan1, plan2)).asInstanceOf[Union]
-      val r2 = widenSetOperationTypes(Except(plan1, plan2)).asInstanceOf[Except]
-      val r3 = widenSetOperationTypes(Intersect(plan1, plan2)).asInstanceOf[Intersect]
+      val r2 = widenSetOperationTypes(
+        Except(plan1, plan2, isAll = false)).asInstanceOf[Except]
+      val r3 = widenSetOperationTypes(
+        Intersect(plan1, plan2, isAll = false)).asInstanceOf[Intersect]
 
       checkOutput(r1.children.last, Seq(expectedType))
       checkOutput(r2.right, Seq(expectedType))
       checkOutput(r3.right, Seq(expectedType))
 
       val r4 = widenSetOperationTypes(Union(plan2, plan1)).asInstanceOf[Union]
-      val r5 = widenSetOperationTypes(Except(plan2, plan1)).asInstanceOf[Except]
-      val r6 = widenSetOperationTypes(Intersect(plan2, plan1)).asInstanceOf[Intersect]
+      val r5 = widenSetOperationTypes(
+        Except(plan2, plan1, isAll = false)).asInstanceOf[Except]
+      val r6 = widenSetOperationTypes(
+        Intersect(plan2, plan1, isAll = false)).asInstanceOf[Intersect]
 
       checkOutput(r4.children.last, Seq(expectedType))
       checkOutput(r5.left, Seq(expectedType))
@@ -1396,7 +1467,7 @@ class TypeCoercionSuite extends AnalysisTest {
   }
 
   test("SPARK-17117 null type coercion in divide") {
-    val rules = Seq(FunctionArgumentConversion, Division, new ImplicitTypeCasts(conf))
+    val rules = Seq(FunctionArgumentConversion, Division, ImplicitTypeCasts)
     val nullLit = Literal.create(null, NullType)
     ruleTest(rules, Divide(1L, nullLit), Divide(Cast(1L, DoubleType), Cast(nullLit, DoubleType)))
     ruleTest(rules, Divide(nullLit, 1L), Divide(Cast(nullLit, DoubleType), Cast(1L, DoubleType)))
@@ -1419,7 +1490,7 @@ class TypeCoercionSuite extends AnalysisTest {
         DoubleType)))
     Seq(true, false).foreach { convertToTS =>
       withSQLConf(
-        "spark.sql.typeCoercion.compareDateTimestampInTimestamp" -> convertToTS.toString) {
+        "spark.sql.legacy.compareDateTimestampInTimestamp" -> convertToTS.toString) {
         val date0301 = Literal(java.sql.Date.valueOf("2017-03-01"))
         val timestamp0301000000 = Literal(Timestamp.valueOf("2017-03-01 00:00:00"))
         val timestamp0301000001 = Literal(Timestamp.valueOf("2017-03-01 00:00:01"))
